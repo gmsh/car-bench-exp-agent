@@ -5,7 +5,7 @@ USER agentbeats
 RUN mkdir -p /home/agentbeats/.cache/uv
 WORKDIR /home/agentbeats/app
 
-COPY --chown=agentbeats:agentbeats pyproject.toml uv.lock README.md ./
+COPY --chown=agentbeats:agentbeats pyproject.toml uv.lock ./
 COPY --chown=agentbeats:agentbeats src src
 
 RUN \
