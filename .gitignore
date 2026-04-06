@@ -1,0 +1,13 @@
+.env
+.DS_Store
+.python-version
+.venv/
+.agentvenv/
+__pycache__/
+*.pyc
+*.egg-info/
+*.egg
+.vscode/
+build/
+dist/
+external/
