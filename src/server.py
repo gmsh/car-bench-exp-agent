@@ -56,13 +56,13 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="Port to bind the server")
     parser.add_argument("--card-url", type=str, help="External URL for the agent card")
     parser.add_argument(
-        "--agent-llm", 
-        type=str, 
-        default=None,  # Will use env var or fallback
+        "--agent-llm",
+        type=str,
+        default="openai/responses/gpt-5.4",
         help="LLM model (can also be set via AGENT_LLM env var)"
     )
     parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM")
-    parser.add_argument("--thinking", action="store_true", help="Enable thinking mode for the LLM")
+    parser.add_argument("--thinking", action="store_true", default=True, help="Enable thinking mode for the LLM")
     parser.add_argument("--reasoning-effort", type=str, default="medium", help="Reasoning effort level for the LLM")
     parser.add_argument("--interleaved-thinking", action="store_true", help="Enable interleaved thinking for the LLM")
     args = parser.parse_args()
@@ -70,7 +70,7 @@ def main():
     # Support both command-line args and environment variables
     # Priority: CLI args > env vars > default
     import os
-    agent_llm = args.agent_llm or os.getenv("AGENT_LLM", "gpt-5.4-nano")
+    agent_llm = args.agent_llm or os.getenv("AGENT_LLM", "openai/responses/gpt-5.4")
     completion_kwargs = {
         "temperature": args.temperature or float(os.getenv("AGENT_TEMPERATURE", 0.0)),
         "thinking": args.thinking or (os.getenv("AGENT_THINKING", "false").lower() == "true"),
