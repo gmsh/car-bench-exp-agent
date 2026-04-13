@@ -1161,6 +1161,102 @@ class UniversalAmbiguityGuard:
 
 
 # ---------------------------------------------------------------------------
+# MissingToolGuard
+# ---------------------------------------------------------------------------
+
+class MissingToolGuard:
+    """
+    Verifies every LLM-generated tool name exists in the current live tool schema.
+
+    Hallucination tasks intentionally remove certain tools to test whether the agent
+    admits it cannot perform an action (correct) vs. hallucinating a tool call (incorrect).
+
+    On violation: injects CAPABILITY_UNAVAILABLE error and retries LLM once.
+    Double-failure fallback: if retry still calls a missing tool, strip all tool_calls
+    and return a plain text response — a missing tool is never dispatched.
+    """
+
+    def check(
+        self,
+        tool_calls: list[dict],
+        available_tool_names: set[str],
+    ) -> list[PolicyViolation]:
+        violations = []
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            if name not in available_tool_names:
+                violations.append(PolicyViolation(
+                    tc["id"], name,
+                    f"CAPABILITY_UNAVAILABLE: Tool '{name}' is NOT available in this session — "
+                    f"do NOT call '{name}' again. "
+                    f"All other tools in the available tool list remain fully accessible. "
+                    f"Continue reasoning and use whichever available tools can help accomplish "
+                    f"the user's goal. "
+                    f"Only if the goal truly cannot be achieved with any available tool should "
+                    f"you inform the user that the required capability is not available. "
+                    f"Do NOT claim to have performed the action without a tool call."
+                ))
+        return violations
+
+
+# ---------------------------------------------------------------------------
+# ParamSchemaGuard
+# ---------------------------------------------------------------------------
+
+class ParamSchemaGuard:
+    """
+    Checks that every parameter key the LLM included in a tool call actually
+    exists in that tool's live schema properties.
+
+    Lifecycle:
+      1. Instantiate once in __init__.
+      2. Call init_from_schemas(tools) on first schema receipt (no-op after that).
+      3. Call check(tool_calls) on every LLM turn before dispatching.
+    """
+
+    def __init__(self) -> None:
+        self._schema_props: dict[str, set[str]] = {}  # {tool_name: set of valid param names}
+        self._initialized = False
+
+    def init_from_schemas(self, tool_schemas: list[dict]) -> None:
+        if self._initialized:
+            return
+        for tool in tool_schemas:
+            fn = tool.get("function", {})
+            name = fn.get("name", "")
+            props = fn.get("parameters", {}).get("properties", {})
+            self._schema_props[name] = set(props.keys())
+        self._initialized = True
+
+    def check(self, tool_calls: list[dict]) -> list[PolicyViolation]:
+        if not self._initialized:
+            return []
+        violations = []
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            valid_params = self._schema_props.get(name)
+            if valid_params is None:
+                continue  # MissingToolGuard handles unknown tool names
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except Exception:
+                continue
+            for param_key in args:
+                if param_key not in valid_params:
+                    violations.append(PolicyViolation(
+                        tc["id"], name,
+                        f"PARAM_NOT_IN_SCHEMA: Parameter '{param_key}' is NOT available "
+                        f"in the current schema for tool '{name}'. "
+                        f"Do NOT include '{param_key}' in the tool call again. "
+                        f"Use only parameters that appear in the live schema. "
+                        f"If this parameter is required to fulfill the user request, "
+                        f"explain to the user that this capability is not available "
+                        f"in this session."
+                    ))
+        return violations
+
+
+# ---------------------------------------------------------------------------
 # CARBenchAgentExecutor
 # ---------------------------------------------------------------------------
 
@@ -1191,6 +1287,8 @@ class CARBenchAgentExecutor(AgentExecutor):
         self.ctx_id_to_user_msg: dict[str, str] = {}             # latest user message text
 
         # Guards
+        self._missing_tool_guard = MissingToolGuard()   # step 0: tool name in schema?
+        self._param_schema_guard = ParamSchemaGuard()  # step 0.5: param names in schema?
         self._policy_checker = PolicyChecker()
         # Single universal guard replaces DisambiguationGuard + StateCheckGuard + P5ParamGuard
         self._universal_guard = UniversalAmbiguityGuard()
@@ -1303,6 +1401,106 @@ class CARBenchAgentExecutor(AgentExecutor):
                 if retry_tool_calls else []
             ),
         )
+        return retry_content, retry_tool_calls
+
+    def _apply_missing_tool_guard(
+        self,
+        messages, tool_calls, assistant_content, completion_kwargs,
+        tools, ctx_logger,
+    ) -> tuple[dict, list]:
+        """
+        Step 0: verify all LLM-generated tool names exist in the live schema.
+        One retry on violation.  Double-failure fallback strips tool_calls entirely.
+        """
+        available = {t["function"]["name"] for t in tools} if tools else set()
+        if not available:
+            return assistant_content, tool_calls  # schema not yet received — skip
+
+        violations = self._missing_tool_guard.check(tool_calls, available)
+        if not violations:
+            return assistant_content, tool_calls
+
+        ctx_logger.warning(
+            "MissingToolGuard: tool not in schema, retrying LLM",
+            missing_tools=[v.tool_name for v in violations],
+        )
+        retry_content, retry_tool_calls = self._inject_violations_and_retry(
+            messages, tool_calls, assistant_content, completion_kwargs, violations,
+            "Batch cancelled: one or more tools are not available in this session.",
+            ctx_logger, "MissingToolGuard",
+        )
+
+        # Double-failure fallback: retry still calls a missing tool → strip tool_calls
+        if retry_tool_calls:
+            still_missing = [
+                tc["function"]["name"]
+                for tc in retry_tool_calls
+                if tc["function"]["name"] not in available
+            ]
+            if still_missing:
+                ctx_logger.warning(
+                    "MissingToolGuard: retry still calls missing tools, stripping",
+                    still_missing=still_missing,
+                )
+                retry_content.pop("tool_calls", None)
+                if not retry_content.get("content"):
+                    retry_content["content"] = (
+                        "I'm unable to complete this request because the required tool "
+                        "is not currently available in this session."
+                    )
+                return retry_content, None
+
+        return retry_content, retry_tool_calls
+
+    def _apply_param_schema_guard(
+        self,
+        messages, tool_calls, assistant_content, completion_kwargs, ctx_logger,
+    ) -> tuple[dict, list]:
+        """
+        Step 0.5: verify all generated parameter keys exist in the live tool schema.
+        One retry on violation.  Double-failure fallback strips tool_calls entirely.
+        """
+        violations = self._param_schema_guard.check(tool_calls)
+        if not violations:
+            return assistant_content, tool_calls
+
+        ctx_logger.warning(
+            "ParamSchemaGuard: param not in schema, retrying LLM",
+            violated_tools=[v.tool_name for v in violations],
+            invalid_params=[v.message.split("'")[1] for v in violations],
+        )
+        retry_content, retry_tool_calls = self._inject_violations_and_retry(
+            messages, tool_calls, assistant_content, completion_kwargs, violations,
+            "Batch cancelled: tool call includes parameter(s) not in current schema.",
+            ctx_logger, "ParamSchemaGuard",
+        )
+
+        # Double-failure fallback: retry still contains invalid params → strip tool_calls
+        if retry_tool_calls:
+            still_invalid = []
+            for tc in retry_tool_calls:
+                name = tc["function"]["name"]
+                valid = self._param_schema_guard._schema_props.get(name)
+                if valid is None:
+                    continue
+                try:
+                    args = json.loads(tc["function"]["arguments"])
+                except Exception:
+                    continue
+                still_invalid.extend(k for k in args if k not in valid)
+            if still_invalid:
+                ctx_logger.warning(
+                    "ParamSchemaGuard: retry still has invalid params, stripping",
+                    still_invalid=still_invalid,
+                )
+                retry_content.pop("tool_calls", None)
+                if not retry_content.get("content"):
+                    retry_content["content"] = (
+                        "I'm unable to complete this request because the required "
+                        "parameter is not available in this session's tool schema."
+                    )
+                return retry_content, None
+
         return retry_content, retry_tool_calls
 
     def _apply_policy_guard(
@@ -1425,6 +1623,8 @@ class CARBenchAgentExecutor(AgentExecutor):
                         self.ctx_id_to_tools[context.context_id] = tools
                         # Initialise enum P1 patterns from schema (no-op after first call)
                         self._universal_guard.init_from_schemas(tools)
+                        # Initialise param schema lookup (no-op after first call)
+                        self._param_schema_guard.init_from_schemas(tools)
                     elif "tool_results" in data:
                         incoming_tool_results = data["tool_results"]
 
@@ -1543,6 +1743,20 @@ class CARBenchAgentExecutor(AgentExecutor):
             )
 
             # ── guard chain ───────────────────────────────────────────────────
+            # 0. MissingToolGuard — tool name must exist in live schema
+            if tool_calls:
+                assistant_content, tool_calls = self._apply_missing_tool_guard(
+                    messages, tool_calls, assistant_content, completion_kwargs,
+                    tools=tools, ctx_logger=ctx_logger,
+                )
+
+            # 0.5 ParamSchemaGuard — param keys must exist in live schema
+            if tool_calls:
+                assistant_content, tool_calls = self._apply_param_schema_guard(
+                    messages, tool_calls, assistant_content, completion_kwargs,
+                    ctx_logger=ctx_logger,
+                )
+
             # 1. AUT-POL hard rules (PolicyChecker)
             if tool_calls:
                 assistant_content, tool_calls = self._apply_policy_guard(
