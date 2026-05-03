@@ -12,6 +12,7 @@ authoritative view of the vehicle, not against the LLM's own claims.
 from __future__ import annotations
 
 import json
+import re
 
 
 def _parse_bool(value) -> bool | None:
@@ -45,6 +46,22 @@ class StateCache:
         self.fan_direction: str | None = None
         self.window_positions: dict | None = None
         self.sunshade_position: int | None = None
+        self.last_route_options: list[dict] = []
+        self.current_location: dict | None = None
+        self.current_datetime: dict | None = None
+        self.weather_by_location: dict[str, dict] = {}
+
+    def parse_system_prompt(self, system_text: str) -> None:
+        if not system_text:
+            return
+        for label, attr in (("CURRENT_LOCATION", "current_location"), ("DATETIME", "current_datetime")):
+            match = re.search(rf"{label}\s*=\s*(\{{.*?\}})", system_text, re.DOTALL)
+            if not match:
+                continue
+            try:
+                setattr(self, attr, json.loads(match.group(1)))
+            except Exception:
+                pass
 
     def update(self, tool_name: str, args: dict, result_content: str) -> None:
         """Fold a single tool observation into the working-memory snapshot."""
@@ -102,6 +119,8 @@ class StateCache:
                 v = result["sunshade_position"]
                 if isinstance(v, (int, float)):
                     self.sunshade_position = int(v)
+        elif tool_name == "open_close_sunshade" and "percentage" in args:
+            self.sunshade_position = int(args["percentage"])
         elif tool_name == "set_fog_lights" and "on" in args:
             self.fog_lights_on = bool(args["on"])
         elif tool_name == "set_head_lights_high_beams" and "on" in args:
@@ -127,6 +146,14 @@ class StateCache:
                     w.get("id") or w.get("waypoint_id") or w.get("location_id")
                     for w in waypoints if isinstance(w, dict)
                 ]
+        elif tool_name == "get_routes_from_start_to_destination":
+            routes = result.get("routes", [])
+            if isinstance(routes, list) and routes:
+                self.last_route_options = routes
+        elif tool_name == "get_weather":
+            location_id = args.get("location_or_poi_id")
+            if location_id and isinstance(result, dict):
+                self.weather_by_location[location_id] = result
         elif tool_name in _NAV_EDITING_TOOLS:
             self.nav_active = True
 

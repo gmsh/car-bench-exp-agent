@@ -334,15 +334,21 @@ class CARBenchAgentExecutor(AgentExecutor):
     def _apply_policy_guard(
         self,
         messages, tool_calls, assistant_content, completion_kwargs, state, ctx_logger,
+        last_user_msg: str = "",
     ) -> tuple[dict, list]:
         """Enforce vehicle-policy invariants via PolicyChecker. One retry on violation."""
-        violations = self._policy_checker.check(tool_calls, state)
+        violations = self._policy_checker.check(
+            tool_calls,
+            state,
+            ctx={"last_user_msg": last_user_msg},
+        )
         if not violations:
             return assistant_content, tool_calls
 
         ctx_logger.warning(
             "PolicyGuard: policy violation, retrying LLM",
             violated_tools=[v.tool_name for v in violations],
+            violated_policies=[v.policy_id for v in violations],
         )
         return self._inject_violations_and_retry(
             messages, tool_calls, assistant_content, completion_kwargs, violations,
@@ -442,6 +448,7 @@ class CARBenchAgentExecutor(AgentExecutor):
                                 "role": "system",
                                 "content": EXTRA_INSTRUCTIONS + "\n\n" + system_prompt,
                             })
+                            state.parse_system_prompt(system_prompt)
                     else:
                         user_message_text = text
                 elif isinstance(part.root, DataPart):
@@ -470,6 +477,17 @@ class CARBenchAgentExecutor(AgentExecutor):
         except Exception as e:
             logger.warning(f"Failed to parse message parts: {e}, using fallback")
             user_message_text = context.get_user_input()
+
+        if user_message_text and "System:" in user_message_text and "\n\nUser:" in user_message_text:
+            parts_split = user_message_text.split("\n\nUser:", 1)
+            system_prompt = parts_split[0].replace("System:", "", 1).strip()
+            user_message_text = parts_split[1].strip()
+            if not messages:
+                messages.append({
+                    "role": "system",
+                    "content": EXTRA_INSTRUCTIONS + "\n\n" + system_prompt,
+                })
+                state.parse_system_prompt(system_prompt)
 
         # Store latest user message for P1 detection in the cascade (updated every turn)
         if user_message_text:
@@ -590,6 +608,7 @@ class CARBenchAgentExecutor(AgentExecutor):
                 assistant_content, tool_calls = self._apply_policy_guard(
                     messages, tool_calls, assistant_content, completion_kwargs,
                     state, ctx_logger,
+                    last_user_msg=self.ctx_id_to_user_msg.get(context.context_id, ""),
                 )
 
             # 2. P1–P5 disambiguation cascade (UniversalAmbiguityGuard)
