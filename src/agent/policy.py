@@ -200,6 +200,8 @@ def _check_009(tool_calls, state, ctx):
     out = []
     cur_loc_id = (state.current_location or {}).get("id") if state.current_location else None
     weather = state.weather_by_location.get(cur_loc_id) if cur_loc_id else None
+    if weather is None and len(state.weather_by_location) == 1:
+        weather = next(iter(state.weather_by_location.values()))
     confirmed = is_affirmative(ctx.get("last_user_msg", ""))
 
     for tc in tool_calls:
@@ -213,13 +215,14 @@ def _check_009(tool_calls, state, ctx):
         else:
             continue
 
-        if not cur_loc_id:
+        if not cur_loc_id and weather is None:
             continue
         if weather is None:
+            location_hint = cur_loc_id or "the current location"
             out.append(PolicyViolation(
                 tc["id"], name,
                 f"Policy violation (009): {kind} requires checking current weather "
-                f"first via get_weather for the current location ({cur_loc_id}).",
+                f"first via get_weather for {location_hint}.",
                 policy_id="009",
             ))
             continue

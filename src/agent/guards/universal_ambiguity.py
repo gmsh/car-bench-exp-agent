@@ -23,6 +23,7 @@ the LLM one retry to repair the batch.
 """
 from __future__ import annotations
 
+import json
 import re
 
 from ..policy import PolicyViolation
@@ -72,7 +73,11 @@ class UniversalAmbiguityGuard:
             return
 
         for tool in tool_schemas:
+            if not isinstance(tool, dict):
+                continue
             fn = tool.get("function", {})
+            if not isinstance(fn, dict):
+                continue
             name = fn.get("name", "")
 
             # Always analyze and cache the tool's parameter structure
@@ -83,11 +88,18 @@ class UniversalAmbiguityGuard:
             if not cfg:
                 continue
 
-            props = fn.get("parameters", {}).get("properties", {})
+            params = fn.get("parameters", {})
+            if not isinstance(params, dict):
+                params = {}
+            props = params.get("properties", {})
+            if not isinstance(props, dict):
+                props = {}
             parameter_configs = cfg.get("params", {})
 
             for parameter_name, parameter_config in parameter_configs.items():
                 pschema = props.get(parameter_name, {})
+                if not isinstance(pschema, dict):
+                    pschema = {}
 
                 if parameter_config.get("p1_from_enum"):
                     # Build regex from THIS parameter's enum values only
@@ -108,10 +120,16 @@ class UniversalAmbiguityGuard:
         self._schemas_initialized = True
 
     def _p1_satisfied(
-        self, tool_name: str, parameter_name: str, parameter_config: dict, user_msg: str
+        self,
+        tool_name: str,
+        parameter_name: str,
+        parameter_config: dict,
+        user_msg: str,
+        argument_value=None,
     ) -> bool:
         """
-        Return True if the user message contains an explicit value for this parameter (P1).
+        Return True if the user message or resolved tool argument contains an explicit
+        value for this parameter (P1).
 
         Resolution order:
           1. ``p1_pattern`` in ``parameter_config``
@@ -125,7 +143,11 @@ class UniversalAmbiguityGuard:
             pattern = self._parameter_p1_patterns.get(tool_name, {}).get(parameter_name)
         if pattern is None:
             return False
-        return bool(pattern.search(user_msg or ""))
+        if pattern.search(user_msg or ""):
+            return True
+        if argument_value is None:
+            return False
+        return bool(pattern.search(str(argument_value)))
 
     def check(
         self,
@@ -160,13 +182,17 @@ class UniversalAmbiguityGuard:
                 continue  # tool not in registry — no ambiguity rules apply
 
             parameter_configs: dict = cfg.get("params", {})
+            try:
+                args = json.loads(tc["function"].get("arguments") or "{}")
+            except Exception:
+                args = {}
 
             # ── P4: tool-level state check ────────────────────────────────────
             p4_tools = cfg.get("p4_tools") or []
             if p4_tools:
                 # p4_p1_bypass=True: skip P4 when user already gave us the value explicitly
                 p4_bypass = cfg.get("p4_p1_bypass", False) and any(
-                    self._p1_satisfied(name, pn, pc, user_msg)
+                    self._p1_satisfied(name, pn, pc, user_msg, args.get(pn))
                     for pn, pc in parameter_configs.items()
                 )
                 if not p4_bypass:
@@ -191,7 +217,13 @@ class UniversalAmbiguityGuard:
             reported_p2_categories: set[str] = set()
 
             for parameter_name, parameter_config in parameter_configs.items():
-                p1_ok = self._p1_satisfied(name, parameter_name, parameter_config, user_msg)
+                p1_ok = self._p1_satisfied(
+                    name,
+                    parameter_name,
+                    parameter_config,
+                    user_msg,
+                    args.get(parameter_name),
+                )
 
                 # ── P2: preference observation check ──────────────────────────
                 preference_category = parameter_config.get("p2_pref_cat")
@@ -219,6 +251,8 @@ class UniversalAmbiguityGuard:
 
                 # ── P5: continuous-range parameter — must ask user ────────────
                 if parameter_config.get("p5_required") and not p1_ok:
+                    if preference_category and preference_category in preference_categories_observed and args.get(parameter_name) is not None:
+                        continue
                     p5_p1 = parameter_config.get("p5_p1_pattern")
                     if not (p5_p1 and p5_p1.search(user_msg or "")):
                         violations.append(PolicyViolation(
@@ -349,6 +383,7 @@ PARAM_RESOLUTION_REGISTRY: dict[str, dict] = {
                     r'\b(level\s*\d|\d\s*level|off|max(?:imum)?)\b', re.I
                 ),
                 "p2_pref_cat": "vehicle_settings.climate_control",
+                "p5_required": True,
             },
             "seat_zone": {
 

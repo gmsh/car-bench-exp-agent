@@ -303,23 +303,15 @@ class CARBenchAgentExecutor(AgentExecutor):
             ctx_logger, "ParamSchemaGuard",
         )
 
-        # Double-failure fallback: retry still contains invalid params → strip tool_calls
+        # Double-failure fallback: retry still violates the live schema → strip tool_calls.
+        # Reuse the guard so required-parameter omissions are handled the same way
+        # as unknown parameter names.
         if retry_tool_calls:
-            still_invalid = []
-            for tc in retry_tool_calls:
-                name = tc["function"]["name"]
-                valid = self._param_schema_guard._schema_props.get(name)
-                if valid is None:
-                    continue
-                try:
-                    args = json.loads(tc["function"]["arguments"])
-                except Exception:
-                    continue
-                still_invalid.extend(k for k in args if k not in valid)
-            if still_invalid:
+            retry_violations = self._param_schema_guard.check(retry_tool_calls)
+            if retry_violations:
                 ctx_logger.warning(
                     "ParamSchemaGuard: retry still has invalid params, stripping",
-                    still_invalid=still_invalid,
+                    still_invalid=[v.message for v in retry_violations],
                 )
                 retry_content.pop("tool_calls", None)
                 if not retry_content.get("content"):
@@ -456,10 +448,18 @@ class CARBenchAgentExecutor(AgentExecutor):
                     if "tools" in data:
                         tools = data["tools"]
                         self.ctx_id_to_tools[context.context_id] = tools
-                        # Initialise per-parameter P1 patterns from schema (no-op after first call)
-                        self._universal_guard.init_from_schemas(tools)
-                        # Initialise the parameter-schema index (no-op after first call)
+                        # Initialise the parameter-schema index first. It is
+                        # required for hallucination/missing-parameter tasks
+                        # and must not be blocked by broader ambiguity analysis.
                         self._param_schema_guard.init_from_schemas(tools)
+                        # Initialise per-parameter P1 patterns from schema (no-op after first call)
+                        try:
+                            self._universal_guard.init_from_schemas(tools)
+                        except Exception as e:
+                            ctx_logger.warning(
+                                "UniversalAmbiguityGuard schema init failed; continuing",
+                                error=str(e),
+                            )
                     elif "tool_results" in data:
                         incoming_tool_results = data["tool_results"]
 
@@ -494,6 +494,7 @@ class CARBenchAgentExecutor(AgentExecutor):
             self.ctx_id_to_user_msg[context.context_id] = user_message_text
 
         # ── process tool results ──────────────────────────────────────────────
+        handled_tool_results = False
         if messages and messages[-1].get("role") == "assistant" and messages[-1].get("tool_calls"):
             prev_tool_calls = messages[-1]["tool_calls"]
 
@@ -549,6 +550,7 @@ class CARBenchAgentExecutor(AgentExecutor):
                 ]
 
             messages.extend(tool_results)
+            handled_tool_results = True
         else:
             # New user message: append and reset tools_called for this turn
             messages.append({"role": "user", "content": user_message_text})
@@ -624,7 +626,7 @@ class CARBenchAgentExecutor(AgentExecutor):
                 )
 
             # 3. ActionClaimGuard — text claims state change with no tool call
-            if not tool_calls and assistant_content.get("content"):
+            if not handled_tool_results and not tool_calls and assistant_content.get("content"):
                 assistant_content = self._apply_action_claim_guard(
                     messages, assistant_content, completion_kwargs, ctx_logger,
                 )
