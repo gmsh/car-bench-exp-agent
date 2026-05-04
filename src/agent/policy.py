@@ -401,6 +401,60 @@ def _check_019(tool_calls, state, ctx):
     return out
 
 
+_ROUTE_SELECTION_EXPLICIT = re.compile(
+    r"\b(fastest|shortest|first|second|third|route\s+option|via\s+[A-Z0-9])\b",
+    re.I,
+)
+
+
+def _check_single_segment_route_selection(tool_calls, state, ctx):
+    out = []
+    if state.route_selection_preference_present:
+        return out
+    user_msg = ctx.get("last_user_msg", "") or ""
+    if _ROUTE_SELECTION_EXPLICIT.search(user_msg):
+        return out
+
+    for tc in tool_calls:
+        name = tc["function"]["name"]
+        single_segment_edit = (
+            name == "navigation_replace_final_destination" and len(state.nav_waypoints) <= 2
+        ) or (
+            name == "navigation_delete_waypoint" and len(state.nav_waypoints) == 3
+        )
+        if not single_segment_edit:
+            continue
+        out.append(PolicyViolation(
+            tc["id"], name,
+            "Ambiguity violation: This navigation edit leaves one direct route segment and "
+            "the user has not selected a route option. Present the fastest and shortest "
+            "routes and ask which route to use before editing navigation.",
+            policy_id="AMB_SINGLE_SEGMENT_ROUTE",
+        ))
+    return out
+
+
+def _check_reading_light_all(tool_calls, state, ctx):
+    out = []
+    user_msg = ctx.get("last_user_msg", "") or ""
+    explicit_all = re.search(r"\b(all|both|everyone|everybody|all\s+reading\s+lights)\b", user_msg, re.I)
+    for tc in tool_calls:
+        if tc["function"]["name"] != "set_reading_light":
+            continue
+        if str(_arg(tc, "position") or "").upper() != "ALL":
+            continue
+        if explicit_all:
+            continue
+        out.append(PolicyViolation(
+            tc["id"], "set_reading_light",
+            "Ambiguity violation: The user did not explicitly ask for all reading lights. "
+            "Ask which reading light position they want, or use the specific position if it "
+            "is explicitly resolved.",
+            policy_id="AMB_READING_LIGHT",
+        ))
+    return out
+
+
 def _check_023(tool_calls, state, ctx):
     if state.current_datetime is None:
         return []
@@ -472,6 +526,8 @@ POLICY_CAPABILITY_REGISTRY: list[PolicyCapability] = [
     PolicyCapability("017", "Editing tools require active nav", _check_017),
     PolicyCapability("018", "Use editing tools when nav active", _check_018),
     PolicyCapability("019", "Cannot delete sole destination", _check_019),
+    PolicyCapability("AMB_SINGLE_SEGMENT_ROUTE", "Single-segment edits need route choice", _check_single_segment_route_selection),
+    PolicyCapability("AMB_READING_LIGHT", "Reading light ALL requires explicit all", _check_reading_light_all),
     PolicyCapability("023", "Calendar restricted to current day", _check_023),
     PolicyCapability("024", "Weather restricted to current day", _check_024),
 ]

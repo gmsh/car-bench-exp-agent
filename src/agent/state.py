@@ -47,6 +47,7 @@ class StateCache:
         self.window_positions: dict | None = None
         self.sunshade_position: int | None = None
         self.last_route_options: list[dict] = []
+        self.route_selection_preference_present: bool = False
         self.current_location: dict | None = None
         self.current_datetime: dict | None = None
         self.weather_by_location: dict[str, dict] = {}
@@ -150,6 +151,11 @@ class StateCache:
             routes = result.get("routes", [])
             if isinstance(routes, list) and routes:
                 self.last_route_options = routes
+        elif tool_name == "get_user_preferences":
+            nav = result.get("navigation_and_routing")
+            if isinstance(nav, dict):
+                pref = nav.get("route_selection")
+                self.route_selection_preference_present = bool(pref)
         elif tool_name == "get_weather":
             location_id = args.get("location_or_poi_id")
             if location_id and isinstance(result, dict):
