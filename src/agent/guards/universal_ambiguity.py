@@ -376,7 +376,7 @@ PARAM_RESOLUTION_REGISTRY: dict[str, dict] = {
     },
 
     "set_seat_heating": {
-        "p4_tools": None,
+        "p4_tools": ["get_seat_heating_level"],
         "params": {
             "level": {
                 "p1_pattern": re.compile(
