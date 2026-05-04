@@ -35,13 +35,21 @@ def _analyze_tool_parameters(tool_schema: dict) -> dict:
 
     """
     fn = tool_schema.get("function", tool_schema)
+    if not isinstance(fn, dict):
+        fn = {}
     parameters_schema = fn.get("parameters", {})
+    if not isinstance(parameters_schema, dict):
+        parameters_schema = {}
     properties = parameters_schema.get("properties", {})
-    required = list(parameters_schema.get("required", []))
+    if not isinstance(properties, dict):
+        properties = {}
+    required_raw = parameters_schema.get("required", [])
+    required = [p for p in required_raw if isinstance(p, str)] if isinstance(required_raw, list) else []
 
     parameters: dict[str, str] = {
         pname: _classify_parameter(pschema)
         for pname, pschema in properties.items()
+        if isinstance(pschema, dict)
     }
     count = len(parameters)
 
